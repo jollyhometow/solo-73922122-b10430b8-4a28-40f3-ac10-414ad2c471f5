@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# Runtime SQLite data (never commit witness/archive databases)
+*.db
+*.db-wal
+*.db-shm
+
+# Local demo working dirs
+demo-samples/out/

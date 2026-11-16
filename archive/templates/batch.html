@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block title %}批次 {{ batch_id }}{% endblock %}
+{% block body %}
+<div class="card">
+  <h2>批次 <span class="mono">{{ batch_id }}</span></h2>
+  <div class="row">
+    <button class="secondary" id="reconcileBtn">接续待核文件</button>
+    <button class="secondary" id="refreshBtn">刷新</button>
+  </div>
+  <div id="box"></div>
+</div>
+{% endblock %}
+{% block script %}
+<script>
+const batchId = {{ batch_id | tojson }};
+async function load() {
+  const r = await fetch(`/api/batches/${encodeURIComponent(batchId)}`);
+  const box = document.getElementById('box');
+  if (!r.ok) { box.innerHTML = '<p class="bad">批次不存在</p>'; return; }
+  const b = await r.json();
+  const pill = b.status === 'complete' ? 'complete'
+             : b.status === 'pending' ? 'pending' : 'incomplete';
+  let html = `<p>整体状态：<span class="pill ${pill}">${b.status}</span>
+              （文件 ${b.file_count}，已登记 ${b.registered_count}）</p>
+    <table><tr><th>文件</th><th>长度</th><th>SHA-256</th><th>状态</th>
+    <th>回执/错误</th><th>下载</th></tr>`;
+  for (const f of b.files) {
+    const fpill = f.status === 'registered'
+      ? '<span class="pill complete">registered</span>'
+      : '<span class="pill pending">pending 待核</span>';
+    const detail = f.status === 'registered'
+      ? `<span class="mono">${f.receipt.algorithm} 签发于 ${f.receipt.issued_at}<br>
+         sig=${f.receipt.signature.slice(0, 48)}…</span>`
+      : `<span class="warn">${f.last_error || ''}</span>`;
+    const dl = f.status === 'registered'
+      ? `<a href="/api/batches/${encodeURIComponent(batchId)}/download/${
+           encodeURIComponent(f.filename)}">下载</a>`
+      : '<span class="muted">未开放</span>';
+    html += `<tr><td>${f.filename}</td><td>${f.length}</td>
+      <td class="mono">${f.sha256}</td><td>${fpill}</td>
+      <td>${detail}</td><td>${dl}</td></tr>`;
+  }
+  html += '</table>';
+  box.innerHTML = html;
+}
+document.getElementById('refreshBtn').onclick = load;
+document.getElementById('reconcileBtn').onclick = async () => {
+  const r = await fetch('/api/reconcile', { method: 'POST' });
+  alert(JSON.stringify(await r.json(), null, 2));
+  load();
+};
+load();
+</script>
+{% endblock %}

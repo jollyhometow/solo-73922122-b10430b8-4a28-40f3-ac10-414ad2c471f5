@@ -1,0 +1,61 @@
+services:
+  witness:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: research-archive/app:latest
+    container_name: research-witness
+    command: >
+      sh -c "mkdir -p /data &&
+             uvicorn witness.main:app --host 0.0.0.0 --port 8001"
+    environment:
+      WITNESS_DB: /data/witness.db
+      WITNESS_KEY: /app/keys/witness_ed25519.pem
+      WITNESS_MAX_UPLOAD_BYTES: "2097152"
+    volumes:
+      - witness_data:/data
+    ports:
+      - "8001:8001"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8001/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  archive:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: research-archive/app:latest
+    container_name: research-archive
+    command: >
+      sh -c "mkdir -p /data/originals &&
+             uvicorn archive.main:app --host 0.0.0.0 --port 8000"
+    environment:
+      ARCHIVE_DB: /data/archive.db
+      ARCHIVE_STORAGE: /data/originals
+      ARCHIVE_PUBLIC_KEY: /app/keys/witness_ed25519.pub.pem
+      ARCHIVE_CRASH_MARKER: /data/crash_after_witness.flag
+      WITNESS_URL: http://witness:8001
+      ARCHIVE_MAX_UPLOAD_BYTES: "2097152"
+    volumes:
+      - archive_data:/data
+    ports:
+      - "8000:8000"
+    depends_on:
+      witness:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/api/batches')"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+volumes:
+  # Independent persistent volumes: the two services never share storage.
+  witness_data:
+  archive_data:

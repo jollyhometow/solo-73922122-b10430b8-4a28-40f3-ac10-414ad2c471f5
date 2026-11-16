@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% block title %}独立核查{% endblock %}
+{% block body %}
+<div class="card">
+  <h2>按见证已签发清单逐批核查</h2>
+  <p class="muted">核查以见证服务持久化的已签发回执清单为准，而不是只看本地目录。
+     逐文件进行：固定公钥验签 → 重算本地原件 SHA-256/长度 → 检查目录登记。
+     见证不可达时一律不得通过。</p>
+  <button id="runBtn">开始核查</button>
+  <div id="summary"></div>
+  <div id="box"></div>
+</div>
+{% endblock %}
+{% block script %}
+<script>
+const TYPE_CN = {
+  missing_original: '缺件',
+  tampered_original: '篡改',
+  catalog_missing: '目录漏登',
+  catalog_pending: '目录未登记完成',
+  receipt_signature_invalid: '回执验签失败',
+  receipt_unavailable: '回执不可用',
+};
+document.getElementById('runBtn').onclick = async () => {
+  document.getElementById('summary').textContent = '核查中……';
+  const r = await fetch('/api/verify');
+  const data = await r.json();
+  const sum = document.getElementById('summary');
+  if (!data.witness_reachable) {
+    sum.innerHTML = `<span class="pill bad">核查未通过</span>
+      <span class="bad">见证服务不可达，不能报核查通过：${data.error}</span>`;
+    document.getElementById('box').innerHTML = '';
+    return;
+  }
+  sum.innerHTML = (data.passed
+      ? '<span class="pill good">核查通过</span>'
+      : '<span class="pill bad">核查未通过</span>') +
+    ` 见证回执总数：${data.receipt_count}` +
+    (data.empty ? '（见证清单为空，无回执可核查，不视为通过）' : '');
+  let html = '';
+  for (const b of data.batches) {
+    html += `<h3 class="${b.passed ? 'ok' : 'bad'}">批次 ${b.batch_id}
+             （${b.passed ? '通过' : '存在问题'}）</h3>
+      <table><tr><th>文件</th><th>验签</th><th>本地原件</th>
+      <th>目录登记</th><th>问题</th></tr>`;
+    for (const f of b.files) {
+      const local = f.local.present
+        ? `${f.local.length} B<br><span class="mono">${f.local.sha256.slice(0,24)}…</span>`
+        : '<span class="bad">缺失</span>';
+      const problems = f.problems.length
+        ? f.problems.map(p =>
+            `<span class="bad">${TYPE_CN[p.type] || p.type}</span>` +
+            `<div class="muted">${p.detail || ''}</div>`).join('')
+        : '<span class="ok">无</span>';
+      html += `<tr><td>${f.filename}</td>
+        <td>${f.receipt_signature_ok
+            ? '<span class="pill good">通过</span>'
+            : '<span class="pill bad">失败</span>'}</td>
+        <td>${local}</td>
+        <td>${f.catalogued ? '已登记' : '<span class="bad">漏登</span>'}</td>
+        <td>${problems}</td></tr>`;
+    }
+    html += '</table>';
+  }
+  document.getElementById('box').innerHTML = html ||
+    '<p class="muted">见证清单为空。</p>';
+};
+</script>
+{% endblock %}

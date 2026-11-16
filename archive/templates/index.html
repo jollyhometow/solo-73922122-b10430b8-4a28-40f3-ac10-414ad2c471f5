@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% block title %}上传与批次 · 科研数据归档{% endblock %}
+{% block body %}
+<div class="card">
+  <h2>按批号上传原件（单个文件 ≤ 2 MiB）</h2>
+  <div class="row">
+    <label>批号 <input id="batch_id" placeholder="例如 BATCH-2026-001" size="22"></label>
+    <label>文件名 <input id="filename" placeholder="例如 readings.csv" size="20"></label>
+    <input type="file" id="file">
+    <button id="uploadBtn">上传归档</button>
+  </div>
+  <p class="muted">流程：本地保存原件 → 送独立见证 → 固定公钥验签 → 目录登记。
+     见证不可达时显示“待核”，不会当作未受理重投；同号同文自动复用回执，异文拒绝。</p>
+  <div id="msg"></div>
+</div>
+
+<div class="card">
+  <h2>本地批次</h2>
+  {% if batches %}
+  <table>
+    <tr><th>批号</th><th>文件数</th><th>已登记</th><th>待核</th><th>首次出现</th><th></th></tr>
+    {% for b in batches %}
+    <tr>
+      <td><a href="/batches/{{ b.batch_id }}">{{ b.batch_id }}</a></td>
+      <td>{{ b.file_count }}</td>
+      <td>{{ b.registered_count }}</td>
+      <td>{{ b.pending_count }}</td>
+      <td class="muted">{{ b.first_seen }}</td>
+      <td><a href="/batches/{{ b.batch_id }}">详情/下载</a></td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p class="muted">暂无批次。</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>故障演示（断连 / 崩溃接续）</h2>
+  <div class="row">
+    <button class="secondary" id="armBtn">武装“见证后崩溃”标记</button>
+    <button class="secondary" id="reconcileBtn">手动接续待核批次</button>
+  </div>
+  <p class="muted">武装后下一次上传会在见证受理后、本地登记前退出进程；
+     Docker 会自动重启容器，启动时自动向见证查明并接续原批。</p>
+  <div id="adminMsg"></div>
+</div>
+{% endblock %}
+{% block script %}
+<script>
+const msg = document.getElementById('msg');
+function setMsg(el, text, cls) { el.className = cls || ''; el.textContent = text; }
+
+document.getElementById('uploadBtn').onclick = async () => {
+  const batch_id = document.getElementById('batch_id').value.trim();
+  const filename = document.getElementById('filename').value.trim();
+  const fileInput = document.getElementById('file');
+  if (!batch_id || !filename || !fileInput.files.length) {
+    setMsg(msg, '请填写批号、文件名并选择文件', 'bad'); return;
+  }
+  const fd = new FormData();
+  fd.append('filename', filename);
+  fd.append('file', fileInput.files[0]);
+  setMsg(msg, '上传中……', 'muted');
+  try {
+    const r = await fetch(`/api/batches/${encodeURIComponent(batch_id)}/files`,
+                          { method: 'POST', body: fd });
+    const data = await r.json();
+    if (r.status === 202) {
+      setMsg(msg, '待核：见证服务不可达，已本地保存并标记 pending，' +
+                  '恢复后请点“手动接续”，不会重复归档。', 'warn');
+    } else if (!r.ok) {
+      setMsg(msg, '失败：' + JSON.stringify(data, null, 2), 'bad');
+    } else {
+      setMsg(msg, '结果：' + data.result +
+                  (data.reused ? '（复用见证回执）' : '') +
+                  '\n批次状态：' + JSON.stringify(data.batch.status), 'ok');
+      setTimeout(() => location.reload(), 900);
+    }
+  } catch (e) {
+    setMsg(msg, '请求失败（容器可能正在崩溃重启）：' + e, 'warn');
+  }
+};
+document.getElementById('armBtn').onclick = async () => {
+  const r = await fetch('/api/admin/arm-crash', { method: 'POST' });
+  setMsg(document.getElementById('adminMsg'),
+         '已武装：' + JSON.stringify(await r.json()), 'warn');
+};
+document.getElementById('reconcileBtn').onclick = async () => {
+  const r = await fetch('/api/reconcile', { method: 'POST' });
+  setMsg(document.getElementById('adminMsg'),
+         JSON.stringify(await r.json(), null, 2), 'ok');
+  setTimeout(() => location.reload(), 1200);
+};
+</script>
+{% endblock %}

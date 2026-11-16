@@ -1,8 +1,10 @@
 """Research data archiving web service.
 
 The archiver uploads originals to an independent witness, verifies every
-Ed25519 receipt with a fixed public key, and only reports success when the
-local original, the catalog entry and the verified receipt are all present.
+Ed25519 receipt against a key ring derived from a single pinned anchor
+public key (later signing keys are reached only through the witness's
+signed rotation chain), and only reports success when the local original,
+the catalog entry and the verified receipt are all present.
 """
 from __future__ import annotations
 
@@ -21,18 +23,22 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 
 from archive.db import Database
+from archive.trust import build_ring, current_fingerprint, verify_receipt
 from archive.witness_client import (
     WitnessClient,
     WitnessConflict,
     WitnessUnreachable,
 )
-from common.receipt import load_public_key, verify_envelope
+from common.receipt import (
+    load_public_key,
+    public_key_fingerprint,
+)
 
 MAX_UPLOAD_BYTES = int(os.getenv("ARCHIVE_MAX_UPLOAD_BYTES", 2 * 1024 * 1024))
 DB_PATH = os.getenv("ARCHIVE_DB", "/data/archive.db")
 STORAGE_DIR = Path(os.getenv("ARCHIVE_STORAGE", "/data/originals"))
 PUBKEY_PATH = os.getenv("ARCHIVE_PUBLIC_KEY",
-                        "/keys/witness_ed25519.pub.pem")
+                        "/app/keys/witness_ed25519.pub.pem")
 WITNESS_URL = os.getenv("WITNESS_URL", "http://witness:8001")
 CRASH_MARKER = Path(os.getenv("ARCHIVE_CRASH_MARKER",
                               "/data/crash_after_witness.flag"))
@@ -41,7 +47,17 @@ KEY_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
 db: Database
 witness: WitnessClient
-public_key = None
+anchor_key = None
+# Verified fingerprint -> public key ring, covering the anchor key and every
+# key reachable through the signed rotation chain. Guarded by _ring_lock.
+key_ring: dict = {}
+ring_proofs: list = []
+ring_error: str | None = None
+_ring_lock = threading.Lock()
+# Only one chain sync against the witness at a time; concurrent callers wait
+# and then reuse the freshly installed ring instead of fanning out requests.
+# Re-entrant because ring_for_fingerprint() calls sync_rotation_chain().
+_sync_lock = threading.RLock()
 templates = Jinja2Templates(directory=os.path.join(
     os.path.dirname(__file__), "templates"))
 
@@ -100,7 +116,7 @@ def batch_status(batch_id: str) -> dict:
     if ok:
         complete = all(
             storage_path(batch_id, r["filename"]).is_file()
-            and verify_receipt(r) for r in registered
+            and check_catalog_receipt(r)[0] for r in registered
         )
     return {
         "batch_id": batch_id,
@@ -113,7 +129,13 @@ def batch_status(batch_id: str) -> dict:
     }
 
 
-def verify_receipt(file_row: dict) -> tuple[bool, str | None]:
+def check_catalog_receipt(file_row: dict) -> tuple[bool, str | None]:
+    """Verify a cataloged receipt against the verified key ring.
+
+    A receipt signed by any key reachable from the fixed anchor through the
+    rotation chain is accepted — including receipts that were issued before a
+    rotation and registered only afterwards (late returns).
+    """
     if not file_row.get("receipt"):
         return False, "no receipt in catalog"
     expected = {
@@ -122,17 +144,122 @@ def verify_receipt(file_row: dict) -> tuple[bool, str | None]:
         "length": file_row["length"],
         "sha256": file_row["sha256"],
     }
-    return verify_envelope(public_key, file_row["receipt"], expected)
+    with _ring_lock:
+        ring = dict(key_ring)
+    return verify_receipt(ring, file_row["receipt"], expected)
+
+
+def ring_snapshot() -> tuple[dict, list, str | None]:
+    with _ring_lock:
+        return dict(key_ring), list(ring_proofs), ring_error
+
+
+def ring_for_fingerprint(fingerprint: str) -> tuple[dict, str | None]:
+    """Return a ring containing ``fingerprint``, syncing from the witness.
+
+    The local ring is normally current, but an upload overlapping with a
+    rotation can be signed by a key the archive has not synced yet. Rather
+    than rejecting a perfectly valid receipt, the chain is re-fetched and
+    re-derived from the fixed anchor (self-reported keys still never enter
+    the ring without a valid signed proof).
+    """
+    with _ring_lock:
+        if fingerprint in key_ring:
+            return dict(key_ring), None
+    # Serialize witness round-trips; another thread may finish the sync first.
+    with _sync_lock:
+        with _ring_lock:
+            if fingerprint in key_ring:
+                return dict(key_ring), None
+        try:
+            sync_rotation_chain()
+        except HTTPException as exc:
+            with _ring_lock:
+                return dict(key_ring), str(exc.detail)
+        except WitnessUnreachable as exc:
+            with _ring_lock:
+                return dict(key_ring), f"witness unreachable: {exc}"
+    with _ring_lock:
+        if fingerprint not in key_ring:
+            return dict(key_ring), (
+                "signing key is not in the verified rotation chain "
+                f"(fingerprint={fingerprint})")
+        return dict(key_ring), None
+
+
+def load_local_chain() -> None:
+    """Re-verify the rotation chain stored in the local catalog from scratch.
+
+    On a cold start nothing on disk is trusted: the pinned anchor key is the
+    only starting point, and every persisted proof must validate against the
+    preceding key before its public key enters the ring.
+    """
+    global key_ring, ring_proofs, ring_error
+    proofs = [json.loads(row["proof"]) for row in db.list_rotations()]
+    ring, err = build_ring(anchor_key, proofs)
+    with _ring_lock:
+        key_ring = ring
+        ring_proofs = proofs
+        ring_error = err
+    if err:
+        print(f"[startup] local rotation chain failed verification: {err}")
+
+
+def sync_rotation_chain() -> dict:
+    """Fetch the witness rotation chain and re-derive the ring from anchor.
+
+    Never installs a chain that cannot be traced back to the fixed public
+    key; on failure the previously verified ring stays in place.
+    """
+    global key_ring, ring_proofs, ring_error
+    with _sync_lock:
+        data = witness.list_rotations()
+        proofs = data.get("rotations", [])
+        if data.get("anchor_public_key_fingerprint") and \
+                data["anchor_public_key_fingerprint"] != \
+                public_key_fingerprint(anchor_key):
+            raise HTTPException(
+                502,
+                "witness rotation chain anchor does not match the fixed "
+                "bootstrap public key; refusing to trust witness keys",
+            )
+        ring, err = build_ring(anchor_key, proofs)
+        if err:
+            with _ring_lock:
+                ring_error = err
+            raise HTTPException(
+                502, f"rotation chain verification failed: {err}")
+        with _ring_lock:
+            key_ring = ring
+            ring_proofs = proofs
+            ring_error = None
+        # Persist only what we independently verified, so a cold start with
+        # the witness offline still has the full ring.
+        db.replace_rotations(proofs)
+        return {"rotations": len(proofs),
+                "current_public_key_fingerprint":
+                    current_fingerprint(ring, proofs),
+                "ring_size": len(ring)}
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global db, witness, public_key
+    global db, witness, anchor_key
     STORAGE_DIR.mkdir(parents=True, exist_ok=True)
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     db = Database(DB_PATH)
     witness = WitnessClient(WITNESS_URL)
-    public_key = load_public_key(PUBKEY_PATH)
+    # The one and only pinned piece of key material, mounted with the image.
+    anchor_key = load_public_key(PUBKEY_PATH)
+    # Cold start: first rebuild the ring from the locally persisted,
+    # independently verified chain (works with the witness offline), then try
+    # to extend it from the witness. Late old-key receipts stay verifiable
+    # because every historical key remains in the ring.
+    load_local_chain()
+    try:
+        sync_rotation_chain()
+    except (HTTPException, WitnessUnreachable, RuntimeError) as exc:
+        print(f"[startup] rotation chain sync deferred: {exc}")
     # Grab the running uvicorn server for the test-only shutdown endpoint.
     import uvicorn.server
     for obj in gc.get_objects():
@@ -180,6 +307,17 @@ def page_batch(request: Request, batch_id: str):
 @app.get("/verify", response_class=HTMLResponse)
 def page_verify(request: Request):
     return templates.TemplateResponse(request, "verify.html", {})
+
+
+@app.get("/rotations", response_class=HTMLResponse)
+def page_rotations(request: Request):
+    ring, proofs, err = ring_snapshot()
+    return templates.TemplateResponse(
+        request,
+        "rotations.html",
+        {"anchor_fingerprint": public_key_fingerprint(anchor_key),
+         "ring": ring, "proofs": proofs, "chain_error": err},
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -274,8 +412,14 @@ def upload_file(batch_id: str,
             os._exit(1)
 
         envelope = response["receipt"]
-        ok, err = verify_envelope(
-            public_key, envelope,
+        ring, ring_err = ring_for_fingerprint(
+            envelope.get("public_key_fingerprint", ""))
+        if ring_err:
+            db.upsert_pending(batch_id, filename, total, digest,
+                              f"receipt verification failed: {ring_err}")
+            raise HTTPException(502, f"receipt verification failed: {ring_err}")
+        ok, err = verify_receipt(
+            ring, envelope,
             expected={"batch_id": batch_id, "filename": filename,
                       "length": total, "sha256": digest},
         )
@@ -319,8 +463,10 @@ def download(batch_id: str, filename: str):
         raise HTTPException(409, "stored original fails integrity check; "
                                  "download refused")
     receipt = json.loads(row["receipt"])
-    ok, err = verify_envelope(
-        public_key, receipt,
+    with _ring_lock:
+        ring = dict(key_ring)
+    ok, err = verify_receipt(
+        ring, receipt,
         expected={"batch_id": batch_id, "filename": filename,
                   "length": length, "sha256": digest},
     )
@@ -406,8 +552,15 @@ def reconcile_one(target: dict) -> dict:
     else:
         envelope = match["receipt"]
 
-    ok, err = verify_envelope(
-        public_key, envelope,
+    ring, ring_err = ring_for_fingerprint(
+        envelope.get("public_key_fingerprint", ""))
+    if ring_err:
+        db.set_error(batch_id, filename,
+                     f"receipt verification failed: {ring_err}")
+        result.update(state="pending", reason=f"bad_receipt: {ring_err}")
+        return result
+    ok, err = verify_receipt(
+        ring, envelope,
         expected={"batch_id": batch_id, "filename": filename,
                   "length": target["length"], "sha256": target["sha256"]},
     )
@@ -473,11 +626,17 @@ def verify_against_witness():
         problems: list[dict] = []
 
         # The full signed envelope travels with the listing; verify it
-        # against the fixed public key (no extra witness round-trips).
+        # against the key that actually signed it, looked up in the ring
+        # derived from the fixed anchor via the rotation chain.
         envelope_resp = item.get("receipt")
         sig_ok, sig_err = (False, "no receipt in witness listing")
         if envelope_resp is not None:
-            sig_ok, sig_err = verify_envelope(public_key, envelope_resp)
+            ring, ring_err = ring_for_fingerprint(
+                envelope_resp.get("public_key_fingerprint", ""))
+            if ring_err:
+                sig_ok, sig_err = False, ring_err
+            else:
+                sig_ok, sig_err = verify_receipt(ring, envelope_resp)
         if not sig_ok:
             problems.append({"type": "receipt_signature_invalid",
                              "detail": sig_err})
@@ -530,6 +689,107 @@ def verify_against_witness():
         "witness_reachable": True,
         "receipt_count": listing["count"],
         "batches": sorted(batches.values(), key=lambda b: b["batch_id"]),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Signing-key rotation (archive-side, verifies every proof from the anchor)
+# --------------------------------------------------------------------------- #
+@app.get("/api/rotations")
+def rotations_status():
+    """Locally verified rotation state and the derived signing-key ring."""
+    ring, proofs, err = ring_snapshot()
+    return {
+        "anchor_public_key_fingerprint":
+            public_key_fingerprint(anchor_key),
+        "current_public_key_fingerprint":
+            current_fingerprint(ring, proofs) if ring else None,
+        "rotation_count": len(proofs),
+        "ring_fingerprints": sorted(ring.keys()),
+        "chain_ok": err is None,
+        "chain_error": err,
+        "rotations": proofs,
+    }
+
+
+@app.get("/api/rotations/{rotation_id}")
+def rotation_result(rotation_id: str):
+    """Return a rotation order's result, syncing the chain from the witness.
+
+    A lost HTTP response is therefore harmless: re-querying the same order id
+    returns the original rotation instead of triggering a second one.
+    """
+    if not KEY_RE.fullmatch(rotation_id):
+        raise HTTPException(400, "invalid rotation_id")
+    local = db.get_rotation(rotation_id)
+    try:
+        witness_answer = witness.get_rotation(rotation_id)
+    except WitnessUnreachable as exc:
+        if local is None:
+            raise HTTPException(
+                503, f"witness unreachable and no local result: {exc}")
+        return {"found": True, "source": "local_verified_chain",
+                "rotation": json.loads(local["proof"])}
+    if not witness_answer.get("rotated"):
+        if local is not None:
+            return {"found": True, "source": "local_verified_chain",
+                    "rotation": json.loads(local["proof"])}
+        raise HTTPException(404, "no rotation with this rotation_id")
+    # The witness answered: re-verify the whole chain from the anchor before
+    # exposing the result as trusted.
+    sync_rotation_chain()
+    local = db.get_rotation(rotation_id)
+    if local is None:
+        raise HTTPException(502, "witness reported a rotation that failed "
+                                 "local chain verification")
+    return {"found": True, "source": "witness_verified_chain",
+            "rotation": json.loads(local["proof"])}
+
+
+@app.post("/api/rotations")
+def submit_rotation(rotation_id: str = Form(...)):
+    """Submit a rotation order, then verify the new proof from the anchor.
+
+    The rotation_id is generated and shown by the web page. Retrying the same
+    id after a lost response returns the original result; concurrent distinct
+    orders are serialized inside the witness and only one succeeds at a time.
+    """
+    if not KEY_RE.fullmatch(rotation_id):
+        raise HTTPException(400, "invalid rotation_id")
+
+    # Idempotency first: if we already verified this order, return its proof.
+    local = db.get_rotation(rotation_id)
+    if local is not None:
+        ring, proofs, err = ring_snapshot()
+        return {"rotated": False, "reused": True,
+                "rotation": json.loads(local["proof"]),
+                "current_public_key_fingerprint":
+                    current_fingerprint(ring, proofs),
+                "chain_ok": err is None}
+
+    try:
+        answer = witness.rotate(rotation_id)
+    except WitnessUnreachable as exc:
+        raise HTTPException(503, f"witness unreachable: {exc}")
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc))
+
+    # Do not trust the witness's self-reported new key: re-walk the entire
+    # chain starting at the fixed anchor. A bad rotation is never installed.
+    sync_info = sync_rotation_chain()
+    local = db.get_rotation(rotation_id)
+    if local is None:
+        raise HTTPException(502, "rotation proof failed anchor verification")
+    ring, proofs, err = ring_snapshot()
+    return {
+        "rotated": answer.get("rotated", False),
+        "reused": answer.get("reused", False),
+        "rotation": json.loads(local["proof"]),
+        "current_public_key_fingerprint":
+            current_fingerprint(ring, proofs),
+        "chain_ok": err is None,
+        "ring_fingerprints": sorted(ring.keys()),
+        "sync": sync_info,
     }
 
 

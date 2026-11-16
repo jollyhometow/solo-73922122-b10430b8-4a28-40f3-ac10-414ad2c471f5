@@ -72,3 +72,36 @@ class WitnessClient:
             raise WitnessUnreachable(str(exc)) from exc
         r.raise_for_status()
         return r.json()
+
+    def list_rotations(self) -> dict[str, Any]:
+        try:
+            with self._client() as c:
+                r = c.get("/rotations")
+        except httpx.RequestError as exc:
+            raise WitnessUnreachable(str(exc)) from exc
+        r.raise_for_status()
+        return r.json()
+
+    def get_rotation(self, rotation_id: str) -> dict[str, Any]:
+        try:
+            with self._client() as c:
+                r = c.get(f"/rotations/{rotation_id}")
+        except httpx.RequestError as exc:
+            raise WitnessUnreachable(str(exc)) from exc
+        if r.status_code == 404:
+            return {"rotated": False, "found": False}
+        r.raise_for_status()
+        return r.json()
+
+    def rotate(self, rotation_id: str) -> dict[str, Any]:
+        try:
+            with self._client() as c:
+                r = c.post("/rotations",
+                           data={"rotation_id": rotation_id})
+        except httpx.RequestError as exc:
+            raise WitnessUnreachable(str(exc)) from exc
+        if r.status_code >= 400:
+            raise RuntimeError(
+                f"witness rejected rotation (HTTP {r.status_code}): {r.text}"
+            )
+        return r.json()

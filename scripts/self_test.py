@@ -145,7 +145,8 @@ class Harness:
     def start_witness(self):
         env = os.environ.copy()
         env.update({"WITNESS_DB": str(self.wdata / "witness.db"),
-                    "WITNESS_KEY": str(self.keys / "witness_ed25519.pem")})
+                    "WITNESS_KEY": str(self.keys / "witness_ed25519.pem"),
+                    "WITNESS_KEY_DIR": str(self.wdata / "keys")})
         p = subprocess.Popen(
             [sys.executable, "-m", "uvicorn", "witness.main:app",
              "--host", HOST, "--port", str(PORT_W)],
@@ -477,6 +478,302 @@ def main() -> int:
         check("witness unreachable => verification 503, never passed",
               s == 503 and report["passed"] is False
               and report["witness_reachable"] is False)
+
+        # ================================================================= #
+        # 11. Signing-key rotation
+        # ================================================================= #
+        # Restart the witness on its same persistent volume for the rotation
+        # suite (its key directory lives alongside the SQLite database).
+        h.start_witness()
+        check("witness restarted for rotation suite", wait_port(PORT_W))
+        s, health = req("GET", PORT_W, "/health")
+        anchor_fp = health["public_key_fingerprint"]
+        check("witness reports a 64-char key fingerprint",
+              s == 200 and len(anchor_fp) == 64)
+
+        # 11a. anchor state: no rotations yet, archive ring == anchor only
+        s, rstate = req("GET", PORT_A, "/api/rotations")
+        check("no rotations initially: ring holds the anchor only",
+              s == 200 and rstate["rotation_count"] == 0
+              and rstate["ring_fingerprints"] == [anchor_fp]
+              and rstate["chain_ok"] is True)
+        s, wr = req("GET", PORT_W, "/rotations")
+        check("witness rotation list initially empty",
+              s == 200 and wr["count"] == 0
+              and wr["current_public_key_fingerprint"] == anchor_fp)
+
+        # A receipt issued before rotation stays in the catalog unchanged.
+        old_batch = "BATCH-OLDKEY"
+        old_content = b"issued,before,rotation\n"
+        s, r = upload(PORT_A, old_batch, "old.csv", old_content)
+        check("pre-rotation upload registers normally",
+              s == 200 and r["result"] == "registered")
+        s, batch = req("GET", PORT_A, f"/api/batches/{old_batch}")
+        old_fp_in_receipt = batch["files"][0]["receipt"][
+            "public_key_fingerprint"]
+        check("pre-rotation receipt carries the anchor fingerprint",
+              old_fp_in_receipt == anchor_fp)
+
+        # 11b. perform one rotation through the archive web API
+        rot1 = "ROT-SELFTEST-0001"
+        s, r1 = req("POST", PORT_A, "/api/rotations",
+                    body=f"rotation_id={rot1}",
+                    headers={"Content-Type":
+                             "application/x-www-form-urlencoded"})
+        fp1 = r1.get("current_public_key_fingerprint")
+        check("rotation order succeeds and switches the active key",
+              s in (200, 201) and r1.get("rotated") is True
+              and fp1 and fp1 != anchor_fp
+              and set(r1["ring_fingerprints"]) == {anchor_fp, fp1},
+              f"http={s}")
+        s, health = req("GET", PORT_W, "/health")
+        check("witness health now reports the new fingerprint",
+              health["public_key_fingerprint"] == fp1)
+
+        # 11c. old private key is gone from the persistent witness volume;
+        #      the new private key is present and the proof is persisted.
+        old_key_file = h.wdata / "keys" / f"{anchor_fp}.pem"
+        new_key_file = h.wdata / "keys" / f"{fp1}.pem"
+        check("old private key removed from persistent storage",
+              not old_key_file.exists())
+        check("new private key persisted in witness volume",
+              new_key_file.exists())
+        s, wr = req("GET", PORT_W, "/rotations")
+        check("rotation proof signed by the old key and persisted",
+              wr["count"] == 1
+              and wr["rotations"][0]["rotation_id"] == rot1
+              and wr["rotations"][0]["old_public_key_fingerprint"]
+              == anchor_fp
+              and wr["rotations"][0]["new_public_key_fingerprint"] == fp1)
+
+        # 11d. same order id retried => original result, no second rotation
+        s, r1b = req("POST", PORT_A, "/api/rotations",
+                     body=f"rotation_id={rot1}",
+                     headers={"Content-Type":
+                              "application/x-www-form-urlencoded"})
+        check("same order retry returns the original result (idempotent)",
+              s == 200 and r1b.get("reused") is True
+              and r1b["rotation"]["rotation_id"] == rot1
+              and r1b["current_public_key_fingerprint"] == fp1)
+        s, wr = req("GET", PORT_W, "/rotations")
+        check("idempotent retry did not create a second rotation",
+              wr["count"] == 1)
+
+        # 11e. query endpoint (the response-loss recovery path)
+        s, q = req("GET", PORT_A, f"/api/rotations/{rot1}")
+        check("rotation result queryable by order id",
+              s == 200 and q["found"] is True
+              and q["rotation"]["rotation_id"] == rot1)
+        s, q = req("GET", PORT_A, "/api/rotations/ROT-NEVER-EXISTED")
+        check("unknown order id returns 404 instead of rotating",
+              s == 404)
+
+        # 11f. new uploads are signed with the new key; old receipts kept
+        new_batch = "BATCH-NEWKEY"
+        new_content = b"issued,after,rotation\n"
+        s, r = upload(PORT_A, new_batch, "new.csv", new_content)
+        check("post-rotation upload registers normally",
+              s == 200 and r["result"] == "registered")
+        s, batch = req("GET", PORT_A, f"/api/batches/{new_batch}")
+        check("post-rotation receipt is signed by the new key",
+              batch["files"][0]["receipt"][
+                  "public_key_fingerprint"] == fp1)
+        s, batch = req("GET", PORT_A, f"/api/batches/{old_batch}")
+        check("historical receipt stays byte-identical (still old key)",
+              batch["files"][0]["receipt"][
+                  "public_key_fingerprint"] == anchor_fp)
+        # Same batch+content still reuses the ORIGINAL receipt.
+        s, r = upload(PORT_A, old_batch, "old.csv", old_content)
+        check("same id+content after rotation still reuses old receipt",
+              s == 200 and r["result"] == "already_registered")
+
+        # 11g. late return of an old-key receipt still verifies: take a
+        # genuine old-key receipt straight from the witness and confirm the
+        # archive's ring accepts it while rejecting an unknown fingerprint.
+        s, wl = req("GET", PORT_W, "/receipts")
+        old_receipt = next(
+            i["receipt"] for i in wl["items"]
+            if i["batch_id"] == old_batch and i["filename"] == "old.csv")
+        from common.receipt import verify_rotation_proof, load_public_key
+        from archive.trust import build_ring, verify_receipt as _vr
+        anchor_key = load_public_key(
+            h.keys / "witness_ed25519.pub.pem")
+        ring, ring_err = build_ring(
+            anchor_key, [p for p in wr["rotations"]])
+        check("archive-style chain rebuild from anchor succeeds",
+              ring_err is None and fp1 in ring)
+        ok_late, _ = _vr(ring, old_receipt)
+        check("late old-key receipt verifies through the key ring",
+              ok_late is True)
+        rogue = dict(old_receipt)
+        rogue["public_key_fingerprint"] = "a" * 64
+        ok_rogue, err_rogue = _vr(ring, rogue)
+        check("receipt with an unchained fingerprint is rejected",
+              ok_rogue is False and "rotation chain" in (err_rogue or ""))
+        # A tampered proof (witness self-announcing a key without a valid
+        # signature) must break chain verification.
+        bad_proof = dict(wr["rotations"][0])
+        bad_proof["signature"] = bad_proof["signature"][:-2] + "AA"
+        ok_bad, err_bad, _ = verify_rotation_proof(bad_proof, anchor_key)
+        check("forged rotation proof is rejected by the anchor key",
+              ok_bad is False and err_bad is not None)
+        bad_chain_ring, bad_chain_err = build_ring(anchor_key, [bad_proof])
+        check("broken chain never installs the announced key",
+              bad_chain_err is not None and fp1 not in bad_chain_ring)
+
+        # 11h. uploads keep working while a rotation is in flight, and
+        # concurrent distinct orders: at most one can succeed at a time and
+        # every order is recorded exactly once.
+        import concurrent.futures as _cf
+        rot_ids = [f"ROT-CONC-{i}" for i in range(4)]
+        # Interleave uploads and rotations to prove service continuity.
+        with _cf.ThreadPoolExecutor(max_workers=6) as ex:
+            rot_futs = [
+                ex.submit(
+                    req, "POST", PORT_A, "/api/rotations",
+                    f"rotation_id={rid}",
+                    {"Content-Type": "application/x-www-form-urlencoded"})
+                for rid in rot_ids
+            ]
+            up_futs = [
+                ex.submit(upload, PORT_A, f"BATCH-DURING-{i}",
+                          f"d{i}.csv", f"during-{i}".encode())
+                for i in range(4)
+            ]
+            rot_results = [f.result() for f in rot_futs]
+            up_results = [f.result() for f in up_futs]
+        check("uploads continue normally during rotations",
+              all(s == 200 and r["result"] == "registered"
+                  for s, r in up_results),
+              str([s for s, _ in up_results]))
+        succeeded = [r["rotation"]["rotation_id"]
+                     for s, r in rot_results if s in (200, 201)]
+        check("every concurrent rotation order recorded exactly once",
+              sorted(succeeded) == sorted(rot_ids)
+              and len(succeeded) == len(set(succeeded)),
+              str(succeeded))
+        s, wr = req("GET", PORT_W, "/rotations")
+        chain_ids = [p["rotation_id"] for p in wr["rotations"]]
+        # Concurrent orders finish nondeterministically; compare as a set and
+        # separately prove each hop is correctly linked to its predecessor.
+        linked = all(
+            wr["rotations"][i]["new_public_key_fingerprint"]
+            == wr["rotations"][i + 1]["old_public_key_fingerprint"]
+            for i in range(len(wr["rotations"]) - 1))
+        check("chain now holds 1 + 4 = 5 correctly linked rotations",
+              wr["count"] == 5 and set(chain_ids[-4:]) == set(rot_ids)
+              and linked,
+              f"count={wr['count']} linked={linked}")
+        s, rstate = req("GET", PORT_A, "/api/rotations")
+        check("archive ring covers anchor plus all 5 rotated keys",
+              rstate["chain_ok"] is True
+              and len(rstate["ring_fingerprints"]) == 6
+              and rstate["rotation_count"] == 5)
+
+        # 11i. full verification still passes across six signing keys.
+        # First reconcile: step 9c deliberately deleted the BATCH-CONC
+        # catalog row to demonstrate catalog_missing detection; the original
+        # and its witnessed receipt are intact, so reconciliation re-registers
+        # it (the catalog_missing condition was already asserted above).
+        s, rec = req("POST", PORT_A, "/api/reconcile")
+        reconciled = [x for x in rec["results"]
+                      if x.get("state") == "registered"]
+        check("reconcile restores the deliberately omitted catalog row",
+              any(x["batch_id"] == b2 and x["filename"] == "data.txt"
+                  for x in reconciled), str(rec)[:200])
+        s, report = req("GET", PORT_A, "/api/verify")
+        if not (s == 200 and report["passed"] is True):
+            for b in report.get("batches", []):
+                for f in b["files"]:
+                    if f["problems"]:
+                        print("DEBUG verify problem:", b["batch_id"],
+                              f["filename"], f["problems"])
+        check("verification passes with the multi-key ring",
+              s == 200 and report["passed"] is True
+              and report["witness_reachable"] is True)
+        s, dl = req("GET", PORT_A,
+                    f"/api/batches/{old_batch}/download/old.csv")
+        check("old-key original still downloadable and byte-identical",
+              s == 200 and dl == old_content)
+
+        # 11j. cold restart of BOTH services: chain, active key, receipts and
+        #      signable state all survive, and the archive re-verifies the
+        #      persisted chain locally before the witness is even contacted.
+        h.shutdown_port(PORT_W)
+        h.shutdown_port(PORT_A)
+        check("both processes exit for the rotation restart test",
+              wait_down(PORT_W, 10) and wait_down(PORT_A, 10))
+        h.start_witness()
+        h.start_archive()
+        check("both services restart on their persistent volumes",
+              wait_port(PORT_W) and wait_port(PORT_A))
+        s, rstate = req("GET", PORT_A, "/api/rotations")
+        check("cold start rebuilds the full verified chain from local DB",
+              rstate["chain_ok"] is True
+              and rstate["rotation_count"] == 5
+              and len(rstate["ring_fingerprints"]) == 6)
+        s, health = req("GET", PORT_W, "/health")
+        newest_fp = wr["rotations"][-1]["new_public_key_fingerprint"]
+        check("witness cold start keeps the newest active key",
+              health["public_key_fingerprint"] == newest_fp)
+        s, report = req("GET", PORT_A, "/api/verify")
+        check("all historical receipts verify after cold restart",
+              s == 200 and report["passed"] is True
+              and report["receipt_count"] == wl["count"] + 4)
+        # No issued records lost on either side.
+        s, wl2 = req("GET", PORT_W, "/receipts")
+        check("witness issued records survive restart without loss",
+              wl2["count"] == wl["count"] + 4)
+        # The service remains fully signable after the restart.
+        s, r = upload(PORT_A, "BATCH-COLD", "c.csv", b"cold-ok\n")
+        check("new receipts still issued after cold restart",
+              s == 200 and r["result"] == "registered"
+              and r["batch"]["files"][0]["receipt"][
+                  "public_key_fingerprint"] == newest_fp)
+
+        # 11k. response loss cannot rotate twice: restart the witness mid-way
+        # is already covered; additionally confirm a brand-new order id used
+        # twice against the witness directly returns the stored proof.
+        s, direct = req("POST", PORT_W, "/rotations",
+                        body="rotation_id=ROT-DIRECT-1",
+                        headers={"Content-Type":
+                                 "application/x-www-form-urlencoded"})
+        s, direct2 = req("POST", PORT_W, "/rotations",
+                         body="rotation_id=ROT-DIRECT-1",
+                         headers={"Content-Type":
+                                  "application/x-www-form-urlencoded"})
+        check("witness-level same-id retry is idempotent",
+              direct2.get("reused") is True
+              and direct2["rotation"] == direct["rotation"])
+        s, sync = req("GET", PORT_A, "/api/rotations/ROT-DIRECT-1")
+        check("archive picks up and verifies the witness-side rotation",
+              s == 200 and sync["rotation"]["rotation_id"]
+              == "ROT-DIRECT-1")
+
+        # 11l. witness unreachable: rotation proxy fails cleanly, no local
+        #      trust state is fabricated.
+        h.shutdown_port(PORT_W)
+        check("witness down for the unreachable-rotation check",
+              wait_down(PORT_W, 10))
+        s, r = req("POST", PORT_A, "/api/rotations",
+                    body="rotation_id=ROT-OFFLINE-1",
+                    headers={"Content-Type":
+                             "application/x-www-form-urlencoded"})
+        check("rotation while witness down returns 503, no fake success",
+              s == 503)
+        s, rstate = req("GET", PORT_A, "/api/rotations")
+        check("failed rotation did not pollute the local verified chain",
+              all(p["rotation_id"] != "ROT-OFFLINE-1"
+                  for p in rstate["rotations"]))
+        s, q = req("GET", PORT_A, "/api/rotations/ROT-OFFLINE-1")
+        check("unknown order query while witness down returns 503",
+              s == 503)
+        # Bring the witness back; previously verified chain still works.
+        h.start_witness()
+        check("witness restored", wait_port(PORT_W))
+        s, report = req("GET", PORT_A, "/api/verify")
+        check("verification works again after witness is restored",
+              s == 200 and report["passed"] is True)
 
     finally:
         h.cleanup()

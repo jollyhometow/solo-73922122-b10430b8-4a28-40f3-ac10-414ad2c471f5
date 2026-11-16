@@ -11,3 +11,6 @@ __pycache__/
 
 # Local demo working dirs
 demo-samples/out/
+
+# Local tooling bootstrap (pip + dependencies used only for offline tests)
+.bootstrap/

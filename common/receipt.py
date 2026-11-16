@@ -19,6 +19,8 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 )
 
 RECEIPT_VERSION = 1
+ROTATION_PROOF_TYPE = "witness_key_rotation"
+ROTATION_PROOF_VERSION = 1
 
 
 def canonicalize(payload: dict) -> bytes:
@@ -121,3 +123,105 @@ def verify_envelope(public_key: Ed25519PublicKey, envelope: dict,
             if field in expected and payload.get(field) != expected[field]:
                 return False, f"receipt field {field} does not match original"
     return True, None
+
+
+# --------------------------------------------------------------------------- #
+# Key serialization helpers (key rotation)
+# --------------------------------------------------------------------------- #
+def public_key_pem(key: Ed25519PublicKey) -> str:
+    return key.public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    ).decode("ascii")
+
+
+def private_key_pem(key: Ed25519PrivateKey) -> bytes:
+    return key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+
+
+def load_public_key_bytes(raw: bytes) -> Ed25519PublicKey:
+    key = serialization.load_pem_public_key(raw)
+    if not isinstance(key, Ed25519PublicKey):
+        raise ValueError("material is not an Ed25519 public key")
+    return key
+
+
+# --------------------------------------------------------------------------- #
+# Signed key-rotation proofs
+#
+# A rotation proof states that the holder of ``old_public_key`` certified a
+# fresh ``new_public_key`` under a unique order id. It is signed by the OLD
+# private key. Chaining these proofs starts at the deployment's fixed public
+# key, so a verifier that only ever pinned that first key can derive every
+# later signing key without trusting self-reported key material.
+# --------------------------------------------------------------------------- #
+def rotation_proof_payload(rotation_id: str, old_fingerprint: str,
+                           new_fingerprint: str, new_public_pem: str,
+                           issued_at: str | None = None) -> dict:
+    return {
+        "type": ROTATION_PROOF_TYPE,
+        "version": ROTATION_PROOF_VERSION,
+        "rotation_id": rotation_id,
+        "old_public_key_fingerprint": old_fingerprint,
+        "new_public_key_fingerprint": new_fingerprint,
+        "new_public_key_pem": new_public_pem,
+        "issued_at": issued_at
+        or datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+
+
+def build_rotation_proof(old_private_key: Ed25519PrivateKey,
+                         rotation_id: str,
+                         new_public_key: Ed25519PublicKey,
+                         issued_at: str | None = None) -> dict:
+    old_fp = public_key_fingerprint(old_private_key.public_key())
+    new_fp = public_key_fingerprint(new_public_key)
+    payload = rotation_proof_payload(
+        rotation_id, old_fp, new_fp, public_key_pem(new_public_key),
+        issued_at)
+    return {
+        **payload,
+        "algorithm": "Ed25519",
+        "signature": sign_payload(old_private_key, payload),
+    }
+
+
+def verify_rotation_proof(proof: dict,
+                          old_public_key: Ed25519PublicKey
+                          ) -> tuple[bool, str | None,
+                                     Ed25519PublicKey | None]:
+    """Verify one rotation proof against the key it claims to rotate from.
+
+    Returns ``(ok, error, new_public_key)``. On success the embedded new public
+    key is returned so callers can walk the chain.
+    """
+    required = {"type", "version", "rotation_id",
+                "old_public_key_fingerprint", "new_public_key_fingerprint",
+                "new_public_key_pem", "issued_at", "algorithm", "signature"}
+    missing = required - set(proof)
+    if missing:
+        return False, f"rotation proof missing fields: {sorted(missing)}", None
+    if proof["type"] != ROTATION_PROOF_TYPE:
+        return False, "rotation proof has wrong type", None
+    if proof["algorithm"] != "Ed25519":
+        return False, "unsupported rotation proof algorithm", None
+    if proof["old_public_key_fingerprint"] != \
+            public_key_fingerprint(old_public_key):
+        return False, "old key fingerprint does not match chain", None
+    payload = {k: proof[k] for k in (
+        "type", "version", "rotation_id", "old_public_key_fingerprint",
+        "new_public_key_fingerprint", "new_public_key_pem", "issued_at")}
+    if not verify_payload(old_public_key, payload, proof["signature"]):
+        return False, "rotation proof signature verification failed", None
+    try:
+        new_key = load_public_key_bytes(
+            proof["new_public_key_pem"].encode("ascii"))
+    except (ValueError, TypeError) as exc:
+        return False, f"embedded new public key is invalid: {exc}", None
+    if public_key_fingerprint(new_key) != proof["new_public_key_fingerprint"]:
+        return False, "embedded key does not match its fingerprint", None
+    return True, None, new_key

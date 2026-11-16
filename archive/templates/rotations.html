@@ -1,0 +1,149 @@
+{% extends "base.html" %}
+{% block title %}见证签名密钥轮换{% endblock %}
+{% block body %}
+<div class="card">
+  <h2>信任根与现用签名密钥</h2>
+  <table>
+    <tr><th>固定锚点公钥指纹（随镜像固定，唯一信任根）</th>
+        <td class="mono">{{ anchor_fingerprint }}</td></tr>
+    <tr><th>已验证密钥环中的公钥数</th>
+        <td>{{ ring | length }}</td></tr>
+    <tr><th>当前见证签名密钥指纹</th>
+        <td class="mono">
+          {% if proofs %}
+            {{ proofs[-1].new_public_key_fingerprint }}
+          {% else %}
+            {{ anchor_fingerprint }}（尚未轮换）
+          {% endif %}
+        </td></tr>
+    <tr><th>链状态</th>
+        <td>
+          {% if chain_error %}
+            <span class="pill bad">校验失败</span>
+            <span class="bad">{{ chain_error }}</span>
+          {% else %}
+            <span class="pill good">全部换钥证明可追溯至锚点</span>
+          {% endif %}
+        </td></tr>
+  </table>
+  <p class="muted">归档端不直接信任见证端自报公钥：每份换钥证明都由旧钥签署，
+     本页所有密钥均从固定锚点公钥逐级验签推导而来。旧钥签发的历史回执
+     （含迟到返回）仍在密钥环内，可继续核查。</p>
+</div>
+
+<div class="card">
+  <h2>提交换钥轮换单</h2>
+  <div class="row">
+    <label>轮换单号（幂等键，同单重试返回原结果）
+      <input id="rotation_id" size="42"></label>
+    <button id="genIdBtn" class="secondary">生成单号</button>
+    <button id="rotateBtn">按现用密钥提交轮换</button>
+  </div>
+  <p class="muted">提交后见证端生成新 Ed25519 密钥、由旧钥出具换钥证明并移除旧私钥；
+     归档端随后从锚点重新验签整条链。换钥期间上传与查询照常服务。</p>
+  <div id="rotateMsg"></div>
+</div>
+
+<div class="card">
+  <h2>按轮换单号查询结果（响应丢失可凭同号取回，不会再换一次钥）</h2>
+  <div class="row">
+    <input id="query_id" placeholder="输入轮换单号" size="42">
+    <button id="queryBtn" class="secondary">查询结果</button>
+  </div>
+  <div id="queryMsg"></div>
+</div>
+
+<div class="card">
+  <h2>已验证换钥证明链（共 {{ proofs | length }} 次轮换）</h2>
+  {% if proofs %}
+  <table>
+    <tr><th>#</th><th>轮换单号</th><th>旧钥指纹</th><th>新钥指纹</th>
+        <th>签发时间</th><th>证明</th></tr>
+    {% for p in proofs %}
+    <tr>
+      <td>{{ loop.index }}</td>
+      <td class="mono">{{ p.rotation_id }}</td>
+      <td class="mono">{{ p.old_public_key_fingerprint[:16] }}…</td>
+      <td class="mono">{{ p.new_public_key_fingerprint[:16] }}…</td>
+      <td>{{ p.issued_at }}</td>
+      <td><details><summary>查看证明</summary>
+        <pre class="mono" style="white-space:pre-wrap;max-width:560px;">{{ p | tojson(indent=2) }}</pre>
+      </details></td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p class="muted">尚无轮换记录，当前签名密钥即固定锚点公钥。</p>
+  {% endif %}
+</div>
+{% endblock %}
+{% block script %}
+<script>
+const rotateMsg = document.getElementById('rotateMsg');
+const queryMsg = document.getElementById('queryMsg');
+function genId() {
+  // RFC4122-ish UUID v4 without external dependencies.
+  const b = crypto.getRandomValues(new Uint8Array(16));
+  b[6] = (b[6] & 0x0f) | 0x40;
+  b[8] = (b[8] & 0x3f) | 0x80;
+  const h = [...b].map(x => x.toString(16).padStart(2, '0')).join('');
+  return `ROT-${h.slice(0,8)}-${h.slice(8,12)}-${h.slice(12,16)}-` +
+         `${h.slice(16,20)}-${h.slice(20)}`;
+}
+document.getElementById('genIdBtn').onclick = () => {
+  document.getElementById('rotation_id').value = genId();
+};
+document.getElementById('rotation_id').value = genId();
+
+function showMsg(el, text, cls) {
+  el.className = cls || '';
+  el.textContent = text;
+}
+
+document.getElementById('rotateBtn').onclick = async () => {
+  const rotation_id = document.getElementById('rotation_id').value.trim();
+  if (!rotation_id) { showMsg(rotateMsg, '请填写轮换单号', 'bad'); return; }
+  showMsg(rotateMsg, '轮换中……（生成密钥、旧钥签署证明、切换并移除旧私钥）',
+          'muted');
+  try {
+    const fd = new FormData();
+    fd.append('rotation_id', rotation_id);
+    const r = await fetch('/api/rotations', { method: 'POST', body: fd });
+    const data = await r.json();
+    if (!r.ok) {
+      showMsg(rotateMsg, '失败：' + JSON.stringify(data, null, 2), 'bad');
+      return;
+    }
+    const reused = data.reused ? '（同单重试，返回原结果，未再次换钥）'
+                               : '（新钥已生效）';
+    showMsg(rotateMsg,
+      (data.rotated ? '轮换成功' : '复用既有轮换') + reused +
+      '\n当前签名密钥指纹：' + data.current_public_key_fingerprint +
+      '\n密钥环：' + JSON.stringify(data.ring_fingerprints, null, 2),
+      'ok');
+    setTimeout(() => location.reload(), 1500);
+  } catch (e) {
+    showMsg(rotateMsg, '请求失败：' + e +
+      '（请用同一轮换单号查询结果，不要重新生成单号）', 'warn');
+  }
+};
+
+document.getElementById('queryBtn').onclick = async () => {
+  const rotation_id = document.getElementById('query_id').value.trim();
+  if (!rotation_id) { showMsg(queryMsg, '请填写轮换单号', 'bad'); return; }
+  try {
+    const r = await fetch(`/api/rotations/${encodeURIComponent(rotation_id)}`);
+    const data = await r.json();
+    if (!r.ok) {
+      showMsg(queryMsg, '未查到：' + JSON.stringify(data, null, 2), 'warn');
+      return;
+    }
+    showMsg(queryMsg,
+      `来源：${data.source}\n` + JSON.stringify(data.rotation, null, 2),
+      'ok');
+  } catch (e) {
+    showMsg(queryMsg, '查询失败：' + e, 'bad');
+  }
+};
+</script>
+{% endblock %}

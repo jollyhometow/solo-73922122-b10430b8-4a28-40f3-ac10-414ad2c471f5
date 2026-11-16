@@ -6,14 +6,21 @@ services:
     image: research-archive/app:latest
     container_name: research-witness
     command: >
-      sh -c "mkdir -p /data &&
+      sh -c "mkdir -p /data/keys &&
              uvicorn witness.main:app --host 0.0.0.0 --port 8001"
     environment:
       WITNESS_DB: /data/witness.db
+      # Bootstrap key from the image: copied into the volume on first start
+      # and used only to anchor the first trust relationship.
       WITNESS_KEY: /app/keys/witness_ed25519.pem
+      # All operational private keys (bootstrap copy + rotated keys) live in
+      # the witness's own persistent volume, never in the image layer.
+      WITNESS_KEY_DIR: /data/keys
       WITNESS_MAX_UPLOAD_BYTES: "2097152"
     volumes:
       - witness_data:/data
+      # Read-only anchor material; the witness writes only under /data.
+      - ./keys:/app/keys:ro
     ports:
       - "8001:8001"
     healthcheck:
@@ -36,12 +43,16 @@ services:
     environment:
       ARCHIVE_DB: /data/archive.db
       ARCHIVE_STORAGE: /data/originals
+      # The fixed anchor public key is the only key material the archive
+      # trusts; later signing keys are derived via the verified chain.
       ARCHIVE_PUBLIC_KEY: /app/keys/witness_ed25519.pub.pem
       ARCHIVE_CRASH_MARKER: /data/crash_after_witness.flag
       WITNESS_URL: http://witness:8001
       ARCHIVE_MAX_UPLOAD_BYTES: "2097152"
     volumes:
       - archive_data:/data
+      # Read-only: the archive never writes key material.
+      - ./keys:/app/keys:ro
     ports:
       - "8000:8000"
     depends_on:

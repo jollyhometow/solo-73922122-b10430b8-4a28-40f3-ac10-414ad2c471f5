@@ -6,6 +6,7 @@ connection. WAL mode keeps concurrent readers/writers working correctly.
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 from contextlib import contextmanager
 
@@ -24,6 +25,19 @@ CREATE TABLE IF NOT EXISTS files (
     UNIQUE(batch_id, filename)
 );
 CREATE INDEX IF NOT EXISTS idx_files_batch ON files(batch_id);
+
+-- Local, independently re-verified copy of the witness rotation chain.
+-- Rows are only written after every proof has been checked from the pinned
+-- anchor key, so even this table is never taken at face value on cold start:
+-- the chain is re-verified before any receipt is accepted.
+CREATE TABLE IF NOT EXISTS key_rotations (
+    id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+    rotation_id               TEXT NOT NULL UNIQUE,
+    old_public_key_fingerprint TEXT NOT NULL,
+    new_public_key_fingerprint TEXT NOT NULL,
+    issued_at                 TEXT NOT NULL,
+    proof                     TEXT NOT NULL
+);
 """
 
 
@@ -128,6 +142,51 @@ class Database:
                        updated_at=datetime('now')
                    WHERE batch_id=? AND filename=?""",
                 (error, batch_id, filename),
+            )
+
+    # ------------------------------------------------------------------ #
+    # Verified rotation chain
+    # ------------------------------------------------------------------ #
+    def list_rotations(self) -> list[sqlite3.Row]:
+        with self.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM key_rotations ORDER BY id ASC"
+            )
+            return cur.fetchall()
+
+    def get_rotation(self, rotation_id: str) -> sqlite3.Row | None:
+        with self.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM key_rotations WHERE rotation_id=?",
+                (rotation_id,),
+            )
+            return cur.fetchone()
+
+    def replace_rotations(self, proofs: list[dict]) -> None:
+        """Persist a freshly verified chain, replacing the previous snapshot.
+
+        Verified snapshots are monotonic extensions of the chain, so rows no
+        longer present in the witness listing (which only ever grows) are
+        deleted first; the swap runs in a single transaction.
+        """
+        with self.cursor() as cur:
+            cur.execute("DELETE FROM key_rotations")
+            cur.executemany(
+                """INSERT INTO key_rotations
+                   (rotation_id, old_public_key_fingerprint,
+                    new_public_key_fingerprint, issued_at, proof)
+                   VALUES (:rotation_id, :old_fp, :new_fp,
+                           :issued_at, :proof)""",
+                [
+                    {
+                        "rotation_id": p["rotation_id"],
+                        "old_fp": p["old_public_key_fingerprint"],
+                        "new_fp": p["new_public_key_fingerprint"],
+                        "issued_at": p["issued_at"],
+                        "proof": json.dumps(p, sort_keys=True),
+                    }
+                    for p in proofs
+                ],
             )
 
     def close(self) -> None:
